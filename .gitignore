@@ -1,0 +1,30 @@
+# Generated outputs
+outputs/
+reports/
+
+# Credentials
+cookies.txt
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+
+# IDE / system
+.vscode/
+.idea/
+.claude/
+.mcp.json
+
+# OS / shell config
+.DS_Store
+.bash_profile
+.bashrc
+.profile
+.zprofile
+.zshrc
+.gitconfig
+.ripgreprc

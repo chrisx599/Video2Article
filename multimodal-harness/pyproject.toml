@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mm-harness"
+version = "0.1.0"
+description = "Video parsing pipeline that turns long videos into an LLM-friendly workspace."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "json-repair>=0.30.0",
+    "numpy>=1.24",
+    "opencv-python>=4.8",
+    "pydantic>=2,<3",
+    "yt-dlp>=2025.3.31",
+]
+
+[project.optional-dependencies]
+dev = []
+
+[project.scripts]
+mm-harness = "video_atlas.cli.main:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+video_atlas = ["skill/SKILL.md"]
