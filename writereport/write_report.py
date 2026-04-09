@@ -32,7 +32,8 @@ class UnitContent:
     detail: str = ""
     subtitles: str = ""
     clip_path: str = ""
-    frame_paths: list[str] = field(default_factory=list)  # extracted keyframe images
+    frame_paths: list[str] = field(default_factory=list)
+    frame_descriptions: dict[str, str] = field(default_factory=dict)  # path -> VLM description
 
 
 @dataclass
@@ -350,7 +351,7 @@ def extract_all_keyframes(
 
             if use_mllm:
                 from .frame_selector import select_frames_for_unit
-                paths = select_frames_for_unit(
+                frame_results = select_frames_for_unit(
                     video_path=video_to_use,
                     start_time=t_start,
                     end_time=t_end,
@@ -361,11 +362,19 @@ def extract_all_keyframes(
                     n_select=frames_per_unit,
                     client=mllm_client,
                     model=mllm_model,
+                    unit_detail=unit.detail,
+                    unit_subtitles=unit.subtitles,
                 )
+                # frame_results is list[dict] with "path" and "description"
+                unit.frame_paths = [r["path"] for r in frame_results]
+                unit.frame_descriptions = {
+                    r["path"]: r["description"]
+                    for r in frame_results if r.get("description")
+                }
             else:
                 start = _hms_to_seconds(t_start) if t_start else 0.0
                 end = _hms_to_seconds(t_end) if t_end else None
-                paths = extract_keyframes(
+                unit.frame_paths = extract_keyframes(
                     video_path=video_to_use,
                     output_dir=frames_dir,
                     prefix=safe_id,
@@ -373,8 +382,6 @@ def extract_all_keyframes(
                     start_time=start,
                     end_time=end,
                 )
-
-            unit.frame_paths = paths
 
 
 # ---------------------------------------------------------------------------
@@ -679,26 +686,71 @@ def create_report(
         frames_dir = report_dir / "frames"
 
     if style == "article":
-        # Step 1: Extract frames (MLLM-selected or evenly-spaced)
-        if frames_dir is not None:
-            extract_all_keyframes(
-                memory, frames_dir, frames_per_unit,
-                use_mllm=use_mllm, mllm_client=mllm_client, mllm_model=mllm_model,
-            )
-
-        # Step 2: LLM writes the article
         w_client = writer_client or mllm_client
         if w_client is None:
             raise ValueError("writer_client or mllm_client required for style='article'")
 
-        from .article_writer import write_article
-        report = write_article(
-            memory=memory,
-            report_dir=report_dir or Path(memory.atlas_dir),
-            focus=focus,
-            client=w_client,
-            model=writer_model,
-        )
+        rd = report_dir or Path(memory.atlas_dir)
+
+        try:
+            # Step 1: Build global frame pool from full video
+            from .frame_pool import extract_candidate_pool, build_frame_pool, match_frames_to_sections
+
+            pool = []
+            if frames_dir is not None and memory.video_path:
+                duration = _hms_to_seconds(memory.video_duration) if memory.video_duration else 600
+                candidates = extract_candidate_pool(
+                    video_path=memory.video_path,
+                    duration=duration,
+                    output_dir=frames_dir / "_candidates",
+                    interval_sec=2.0,
+                )
+                pool = build_frame_pool(candidates, max_pool_size=25)
+
+            # Step 2: Generate article outline (content-first, no frames yet)
+            from .outline_generator import generate_outline
+            outline = generate_outline(
+                memory=memory,
+                focus=focus,
+                client=w_client,
+                model=writer_model,
+            )
+
+            # Step 3: Match frames to sections using VLM
+            if pool and frames_dir is not None:
+                outline = match_frames_to_sections(
+                    pool=pool,
+                    outline=outline,
+                    memory=memory,
+                    frames_dir=frames_dir,
+                    report_dir=rd,
+                    client=mllm_client,
+                    model=mllm_model,
+                    max_frames_per_section=frames_per_unit,
+                )
+
+            # Step 4: Write article section-by-section from outline
+            from .article_writer import write_article_from_outline
+            report = write_article_from_outline(
+                memory=memory,
+                outline=outline,
+                report_dir=rd,
+                focus=focus,
+                client=w_client,
+                model=writer_model,
+            )
+        except Exception as e:
+            print(f"  [create_report] Pipeline failed ({e}), falling back to single-shot")
+            import traceback
+            traceback.print_exc()
+            from .article_writer import write_article
+            report = write_article(
+                memory=memory,
+                report_dir=rd,
+                focus=focus,
+                client=w_client,
+                model=writer_model,
+            )
     else:
         report = generate_report(
             memory,

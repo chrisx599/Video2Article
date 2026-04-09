@@ -57,10 +57,11 @@ TOOL_DEFINITION: dict[str, Any] = {
                 },
                 "style": {
                     "type": "string",
-                    "enum": ["detailed", "summary", "outline"],
+                    "enum": ["article", "detailed", "summary", "outline"],
                     "description": (
                         "Report style. "
-                        "'detailed' includes full unit breakdowns and transcript excerpts. "
+                        "'article' (default) generates an LLM-written article with outline planning and section-by-section writing. "
+                        "'detailed' uses template-based formatting with full unit breakdowns. "
                         "'summary' includes segment summaries only. "
                         "'outline' lists segment and unit titles with time ranges."
                     ),
