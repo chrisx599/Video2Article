@@ -24,8 +24,100 @@ from typing import Any
 
 from openai import OpenAI
 
-from .frame_selector import _extract_candidates, _compute_richness_score
 from .outline_generator import _parse_json_from_response
+
+try:
+    from PIL import Image, ImageFilter
+    import numpy as np
+    _HAS_PIL = True
+except ImportError:
+    _HAS_PIL = False
+
+
+# ---------------------------------------------------------------------------
+# Frame extraction and scoring
+# ---------------------------------------------------------------------------
+
+
+def _extract_candidates(
+    video_path: str,
+    start_time: float,
+    end_time: float,
+    output_dir: Path,
+    prefix: str,
+    interval_sec: float = 2.0,
+) -> list[dict]:
+    """Extract candidate frames at fixed intervals."""
+    video = Path(video_path)
+    if not video.exists():
+        return []
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    duration = end_time - start_time
+    if duration <= 0:
+        return []
+
+    timestamps = []
+    t = start_time + interval_sec / 2
+    while t < end_time:
+        timestamps.append(t)
+        t += interval_sec
+
+    if not timestamps:
+        timestamps = [start_time + duration / 2]
+
+    candidates = []
+    for i, ts in enumerate(timestamps):
+        fname = f"{prefix}_cand_{i:03d}.jpg"
+        out_path = output_dir / fname
+        cmd = (
+            f"ffmpeg -y -loglevel quiet -ss {ts:.2f} "
+            f"-i {shlex.quote(str(video))} "
+            f"-frames:v 1 -q:v 2 {shlex.quote(str(out_path))}"
+        )
+        try:
+            subprocess.run(cmd, shell=True, timeout=10, check=False)
+            if out_path.exists() and out_path.stat().st_size > 0:
+                candidates.append({
+                    "index": i,
+                    "timestamp": ts,
+                    "path": str(out_path),
+                })
+        except Exception:
+            pass
+
+    return candidates
+
+
+def _compute_richness_score(image_path: str) -> float:
+    """Score a frame's visual information density (0.0 to 1.0)."""
+    if not _HAS_PIL:
+        return 0.5
+
+    try:
+        img = Image.open(image_path).convert("L")
+        w, h = img.size
+        if w < 640 or h < 360:
+            return 0.05
+
+        edges = img.filter(ImageFilter.FIND_EDGES)
+        arr = np.array(edges)
+        edge_ratio = float(np.mean(arr > 30))
+
+        cell_h, cell_w = arr.shape[0] // 3, arr.shape[1] // 3
+        active_cells = 0
+        for r in range(3):
+            for c in range(3):
+                cell = arr[r*cell_h:(r+1)*cell_h, c*cell_w:(c+1)*cell_w]
+                if float(np.mean(cell > 30)) > 0.02:
+                    active_cells += 1
+        spread = active_cells / 9.0
+
+        score = (edge_ratio * 3.0) * (0.3 + 0.7 * spread)
+        return min(score, 1.0)
+    except Exception:
+        return 0.5
 
 
 # ---------------------------------------------------------------------------

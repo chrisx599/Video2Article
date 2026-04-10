@@ -1,16 +1,16 @@
 """
-Write Report — read video memory (atlas) and generate frame-text interleaved reports.
+Write Report — load video memory (atlas) and orchestrate article generation.
 
-This module reads a CanonicalAtlas output directory produced by mm-harness
-and generates a Markdown report that interleaves extracted keyframes (images)
-with text analysis, timestamps, and transcript excerpts.
+The pipeline is:
+  1. Load atlas memory (video + segments + units + transcript)
+  2. Generate an article outline (outline_generator)
+  3. Agent-driven frame selection via VLM probing (frame_agent)
+  4. Write the article section-by-section (article_writer)
 """
 
 from __future__ import annotations
 
 import re
-import subprocess
-import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -32,8 +32,6 @@ class UnitContent:
     detail: str = ""
     subtitles: str = ""
     clip_path: str = ""
-    frame_paths: list[str] = field(default_factory=list)
-    frame_descriptions: dict[str, str] = field(default_factory=dict)  # path -> VLM description
 
 
 @dataclass
@@ -79,7 +77,6 @@ def _extract_field(text: str, field_name: str) -> str:
 
 
 def _read_file(path: Path) -> str:
-    """Read a text file, return empty string if missing."""
     try:
         return path.read_text(encoding="utf-8")
     except (FileNotFoundError, PermissionError):
@@ -87,7 +84,6 @@ def _read_file(path: Path) -> str:
 
 
 def _parse_unit_readme(readme_text: str) -> UnitContent:
-    """Parse a unit README.md into UnitContent."""
     return UnitContent(
         unit_id=_extract_field(readme_text, "UnitID"),
         title=_extract_field(readme_text, "Title"),
@@ -100,7 +96,6 @@ def _parse_unit_readme(readme_text: str) -> UnitContent:
 
 
 def _parse_segment_readme(readme_text: str) -> SegmentContent:
-    """Parse a segment README.md into SegmentContent."""
     return SegmentContent(
         segment_id=_extract_field(readme_text, "SegID"),
         title=_extract_field(readme_text, "Title"),
@@ -113,12 +108,11 @@ def _parse_segment_readme(readme_text: str) -> SegmentContent:
 
 
 # ---------------------------------------------------------------------------
-# Frame extraction via ffmpeg
+# Time helpers
 # ---------------------------------------------------------------------------
 
 
 def _hms_to_seconds(hms: str) -> float:
-    """Convert HH:MM:SS or MM:SS to seconds."""
     parts = hms.strip().split(":")
     parts = [float(p) for p in parts]
     if len(parts) == 3:
@@ -129,75 +123,24 @@ def _hms_to_seconds(hms: str) -> float:
 
 
 def _seconds_to_hms(seconds: float) -> str:
-    """Convert seconds to HH:MM:SS."""
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
     s = int(seconds % 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-def extract_keyframes(
-    video_path: str,
-    output_dir: Path,
-    prefix: str,
-    n_frames: int = 3,
-    start_time: float = 0.0,
-    end_time: float | None = None,
-) -> list[str]:
-    """
-    Extract N evenly-spaced keyframes from a video clip using ffmpeg.
+def _format_time_range(start: str, end: str) -> str:
+    if start and end:
+        return f"{start} - {end}"
+    return start or end or ""
 
-    Returns list of relative paths (relative to output_dir parent) for the
-    saved frame images.
-    """
-    video = Path(video_path)
-    if not video.exists():
-        return []
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Probe video duration if end_time not given
-    if end_time is None:
-        probe_cmd = (
-            f"ffprobe -v error -show_entries format=duration "
-            f"-of default=noprint_wrappers=1:nokey=1 {shlex.quote(str(video))}"
-        )
-        try:
-            result = subprocess.run(
-                probe_cmd, shell=True, capture_output=True, text=True, timeout=10
-            )
-            end_time = float(result.stdout.strip())
-        except Exception:
-            end_time = start_time + 60.0  # fallback
-
-    clip_duration = end_time - start_time
-    if clip_duration <= 0:
-        return []
-
-    # Compute timestamps for N evenly-spaced frames
-    if n_frames == 1:
-        timestamps = [start_time + clip_duration / 2]
-    else:
-        step = clip_duration / (n_frames + 1)
-        timestamps = [start_time + step * (i + 1) for i in range(n_frames)]
-
-    frame_paths = []
-    for i, ts in enumerate(timestamps):
-        fname = f"{prefix}_frame_{i+1}.jpg"
-        out_path = output_dir / fname
-        cmd = (
-            f"ffmpeg -y -loglevel quiet -ss {ts:.2f} "
-            f"-i {shlex.quote(str(video))} "
-            f"-frames:v 1 -q:v 2 {shlex.quote(str(out_path))}"
-        )
-        try:
-            subprocess.run(cmd, shell=True, timeout=10, check=False)
-            if out_path.exists() and out_path.stat().st_size > 0:
-                frame_paths.append(str(out_path))
-        except Exception:
-            pass
-
-    return frame_paths
+def _make_relative(frame_path: str, report_dir: Path) -> str:
+    """Make a frame path relative to the report file's directory."""
+    try:
+        return str(Path(frame_path).relative_to(report_dir))
+    except ValueError:
+        return str(frame_path)
 
 
 # ---------------------------------------------------------------------------
@@ -206,28 +149,22 @@ def extract_keyframes(
 
 
 def load_atlas_memory(atlas_dir: str | Path) -> AtlasMemory:
-    """
-    Load a CanonicalAtlas output directory into an AtlasMemory structure.
-    """
+    """Load a CanonicalAtlas output directory into an AtlasMemory structure."""
     root = Path(atlas_dir)
     if not root.is_dir():
         raise FileNotFoundError(f"Atlas directory not found: {atlas_dir}")
 
     memory = AtlasMemory(atlas_dir=str(root))
 
-    # --- Global README ---
     global_readme = _read_file(root / "README.md")
     memory.video_title = _extract_field(global_readme, "Title")
     memory.video_duration = _extract_field(global_readme, "Duration")
     memory.abstract = _extract_field(global_readme, "Abstract")
 
-    # --- Full subtitles ---
     memory.full_subtitles = _read_file(root / "SUBTITLES.md")
 
-    # --- Video path ---
     video_path = root / "video.mp4"
     if not video_path.exists():
-        # Check inside input/ directory for any video file
         input_dir = root / "input"
         if input_dir.is_dir():
             for ext in ("*.mp4", "*.webm", "*.mkv", "*.avi"):
@@ -238,7 +175,6 @@ def load_atlas_memory(atlas_dir: str | Path) -> AtlasMemory:
     if video_path.exists():
         memory.video_path = str(video_path)
 
-    # --- Units ---
     units_dir = root / "units"
     if units_dir.is_dir():
         unit_folders = sorted(
@@ -257,7 +193,6 @@ def load_atlas_memory(atlas_dir: str | Path) -> AtlasMemory:
             memory.units.append(unit)
         memory.num_units = len(memory.units)
 
-    # --- Segments ---
     segments_dir = root / "segments"
     if segments_dir.is_dir():
         seg_folders = sorted(
@@ -270,7 +205,6 @@ def load_atlas_memory(atlas_dir: str | Path) -> AtlasMemory:
                 continue
             segment = _parse_segment_readme(readme_text)
 
-            # Load sub-units within segment folder
             sub_unit_folders = sorted(
                 [d for d in seg_folder.iterdir() if d.is_dir()],
                 key=lambda d: d.name,
@@ -286,7 +220,6 @@ def load_atlas_memory(atlas_dir: str | Path) -> AtlasMemory:
                     sub_unit.clip_path = str(clip)
                 segment.units.append(sub_unit)
 
-            # Segment-level subtitles
             seg_subtitles = _read_file(seg_folder / "SUBTITLES.md")
             if seg_subtitles:
                 segment.subtitles = seg_subtitles
@@ -295,330 +228,21 @@ def load_atlas_memory(atlas_dir: str | Path) -> AtlasMemory:
                     u.subtitles for u in segment.units if u.subtitles
                 )
 
-            # Segment clip
             seg_clip = seg_folder / "video_clip.mp4"
             if seg_clip.exists():
                 segment.clip_path = str(seg_clip)
 
             memory.segments.append(segment)
-        # Sort segments chronologically by start_time
-        memory.segments.sort(key=lambda s: _hms_to_seconds(s.start_time) if s.start_time else 0.0)
+        memory.segments.sort(
+            key=lambda s: _hms_to_seconds(s.start_time) if s.start_time else 0.0
+        )
         memory.num_segments = len(memory.segments)
 
     return memory
 
 
 # ---------------------------------------------------------------------------
-# Frame extraction for the whole atlas
-# ---------------------------------------------------------------------------
-
-
-def extract_all_keyframes(
-    memory: AtlasMemory,
-    frames_dir: Path,
-    frames_per_unit: int = 3,
-    use_mllm: bool = False,
-    mllm_client: Any = None,
-    mllm_model: str = "Qwen/Qwen3-VL-8B-Instruct",
-) -> None:
-    """
-    Extract keyframes for every unit in the atlas and populate
-    unit.frame_paths.
-
-    When use_mllm=True, samples dense candidates and uses a vision LLM
-    to select the most informative frames. Otherwise, picks evenly-spaced frames.
-    """
-    source_video = memory.video_path
-
-    has_source = source_video and Path(source_video).exists()
-
-    for seg in memory.segments:
-        for unit in seg.units:
-            # Prefer source video (use absolute timestamps),
-            # fall back to unit clip (use clip-relative timestamps 0..duration)
-            if has_source:
-                video_to_use = source_video
-                t_start = unit.start_time
-                t_end = unit.end_time
-            elif unit.clip_path and Path(unit.clip_path).exists():
-                video_to_use = unit.clip_path
-                t_start = "00:00:00"
-                t_end = ""  # let ffprobe detect duration
-            else:
-                continue
-
-            safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", unit.unit_id or unit.title[:20])
-
-            if use_mllm:
-                from .frame_selector import select_frames_for_unit
-                frame_results = select_frames_for_unit(
-                    video_path=video_to_use,
-                    start_time=t_start,
-                    end_time=t_end,
-                    unit_title=unit.title,
-                    unit_summary=unit.summary,
-                    frames_dir=frames_dir,
-                    prefix=safe_id,
-                    n_select=frames_per_unit,
-                    client=mllm_client,
-                    model=mllm_model,
-                    unit_detail=unit.detail,
-                    unit_subtitles=unit.subtitles,
-                )
-                # frame_results is list[dict] with "path" and "description"
-                unit.frame_paths = [r["path"] for r in frame_results]
-                unit.frame_descriptions = {
-                    r["path"]: r["description"]
-                    for r in frame_results if r.get("description")
-                }
-            else:
-                start = _hms_to_seconds(t_start) if t_start else 0.0
-                end = _hms_to_seconds(t_end) if t_end else None
-                unit.frame_paths = extract_keyframes(
-                    video_path=video_to_use,
-                    output_dir=frames_dir,
-                    prefix=safe_id,
-                    n_frames=frames_per_unit,
-                    start_time=start,
-                    end_time=end,
-                )
-
-
-# ---------------------------------------------------------------------------
-# Report generation
-# ---------------------------------------------------------------------------
-
-
-def _format_time_range(start: str, end: str) -> str:
-    if start and end:
-        return f"{start} - {end}"
-    return start or end or ""
-
-
-def _truncate_subtitles(text: str, max_chars: int = 500) -> str:
-    if len(text) <= max_chars:
-        return text.strip()
-    truncated = text[:max_chars]
-    last_period = truncated.rfind(".")
-    if last_period > max_chars // 2:
-        truncated = truncated[: last_period + 1]
-    return truncated.strip() + " ..."
-
-
-def _make_relative(frame_path: str, report_dir: Path) -> str:
-    """Make a frame path relative to the report file's directory."""
-    try:
-        return str(Path(frame_path).relative_to(report_dir))
-    except ValueError:
-        return str(frame_path)
-
-
-def generate_report(
-    memory: AtlasMemory,
-    focus: str = "",
-    style: str = "detailed",
-    include_subtitles: bool = True,
-    max_subtitle_chars: int = 500,
-    frames_dir: Path | None = None,
-    frames_per_unit: int = 3,
-    report_dir: Path | None = None,
-    use_mllm: bool = False,
-    mllm_client: Any = None,
-    mllm_model: str = "Qwen/Qwen3-VL-8B-Instruct",
-) -> str:
-    """
-    Generate a frame-text interleaved report from video memory.
-
-    The report interleaves:
-    - Extracted keyframe images from each video segment
-    - Section headers with time ranges
-    - Summaries and detailed descriptions
-    - Transcript excerpts (from subtitles)
-
-    Parameters
-    ----------
-    memory : AtlasMemory
-        Parsed atlas memory from ``load_atlas_memory()``.
-    focus : str
-        Optional focus topic for the report.
-    style : str
-        "detailed", "summary", or "outline".
-    include_subtitles : bool
-        Whether to include transcript excerpts.
-    max_subtitle_chars : int
-        Max chars per subtitle excerpt.
-    frames_dir : Path | None
-        Directory to save extracted keyframes. If None, frames are skipped.
-    frames_per_unit : int
-        Number of keyframes to extract per unit (default 3).
-    report_dir : Path | None
-        Directory where the report will be saved, for computing relative paths.
-    """
-    # Extract keyframes if frames_dir is provided
-    if frames_dir is not None:
-        extract_all_keyframes(
-            memory, frames_dir, frames_per_unit,
-            use_mllm=use_mllm, mllm_client=mllm_client, mllm_model=mllm_model,
-        )
-
-    if report_dir is None:
-        report_dir = frames_dir.parent if frames_dir else Path(memory.atlas_dir)
-
-    lines: list[str] = []
-
-    # === Header ===
-    lines.append(f"# Video Report: {memory.video_title}")
-    lines.append("")
-    if memory.video_duration:
-        lines.append(f"**Duration**: {memory.video_duration}")
-    lines.append("")
-
-    if focus:
-        lines.append(f"> **Report Focus**: {focus}")
-        lines.append("")
-
-    # === Abstract ===
-    lines.append("## Overview")
-    lines.append("")
-    lines.append(memory.abstract or "_No abstract available._")
-    lines.append("")
-
-    # === Structure summary ===
-    lines.append("## Content Structure")
-    lines.append("")
-    lines.append(
-        f"This video has been decomposed into **{memory.num_segments} segments** "
-        f"containing **{memory.num_units} units**."
-    )
-    lines.append("")
-
-    if style == "outline":
-        for i, seg in enumerate(memory.segments, 1):
-            time_range = _format_time_range(seg.start_time, seg.end_time)
-            lines.append(f"{i}. **{seg.title}** ({time_range})")
-            for unit in seg.units:
-                u_range = _format_time_range(unit.start_time, unit.end_time)
-                lines.append(f"   - {unit.title} ({u_range})")
-        lines.append("")
-        return "\n".join(lines)
-
-    # === Table of Contents ===
-    lines.append("### Table of Contents")
-    lines.append("")
-    for i, seg in enumerate(memory.segments, 1):
-        time_range = _format_time_range(seg.start_time, seg.end_time)
-        anchor = re.sub(r"[^a-z0-9-]", "", seg.title.lower().replace(" ", "-"))
-        lines.append(f"{i}. [{seg.title}](#{anchor}) ({time_range})")
-    lines.append("")
-
-    # === Detailed sections ===
-    lines.append("---")
-    lines.append("")
-
-    for i, seg in enumerate(memory.segments, 1):
-        time_range = _format_time_range(seg.start_time, seg.end_time)
-
-        # Segment header
-        lines.append(f"## Section {i}: {seg.title}")
-        lines.append("")
-        lines.append(f"**Time Range**: {time_range} | **Duration**: {seg.duration}")
-        lines.append("")
-
-        # Segment summary
-        if seg.summary:
-            lines.append(seg.summary)
-            lines.append("")
-
-        if style == "summary":
-            lines.append("---")
-            lines.append("")
-            continue
-
-        # Composition rationale
-        if seg.composition_rationale:
-            lines.append(f"*{seg.composition_rationale}*")
-            lines.append("")
-
-        # --- Units: frame-text interleaved ---
-        if seg.units:
-            for j, unit in enumerate(seg.units, 1):
-                u_range = _format_time_range(unit.start_time, unit.end_time)
-
-                lines.append(f"### {i}.{j} {unit.title}")
-                lines.append(f"*{u_range}*")
-                lines.append("")
-
-                # --- Interleave: frame → text → frame → text ---
-
-                # First frame (opening keyframe for this unit)
-                if unit.frame_paths:
-                    rel = _make_relative(unit.frame_paths[0], report_dir)
-                    lines.append(f"![{unit.title} - keyframe]({rel})")
-                    lines.append("")
-
-                # Summary text
-                if unit.summary:
-                    lines.append(unit.summary)
-                    lines.append("")
-
-                # Middle frame(s) interleaved with detail
-                mid_frames = unit.frame_paths[1:-1] if len(unit.frame_paths) > 2 else []
-                if unit.detail:
-                    # Split detail into paragraphs and interleave frames
-                    paragraphs = [p.strip() for p in unit.detail.split("\n\n") if p.strip()]
-                    if not paragraphs:
-                        paragraphs = [unit.detail]
-
-                    for k, para in enumerate(paragraphs):
-                        lines.append(para)
-                        lines.append("")
-                        # Insert a middle frame after a paragraph if available
-                        if k < len(mid_frames):
-                            rel = _make_relative(mid_frames[k], report_dir)
-                            lines.append(f"![{unit.title} - detail]({rel})")
-                            lines.append("")
-                elif mid_frames:
-                    for fp in mid_frames:
-                        rel = _make_relative(fp, report_dir)
-                        lines.append(f"![{unit.title}]({rel})")
-                        lines.append("")
-
-                # Last frame (closing keyframe)
-                if len(unit.frame_paths) >= 2:
-                    rel = _make_relative(unit.frame_paths[-1], report_dir)
-                    lines.append(f"![{unit.title} - end]({rel})")
-                    lines.append("")
-
-                # Transcript excerpt
-                if include_subtitles and unit.subtitles:
-                    excerpt = _truncate_subtitles(unit.subtitles, max_subtitle_chars)
-                    lines.append("<details>")
-                    lines.append(f"<summary>Transcript ({u_range})</summary>")
-                    lines.append("")
-                    lines.append(f"> {excerpt}")
-                    lines.append("")
-                    lines.append("</details>")
-                    lines.append("")
-
-        # Segment-level transcript (if no units)
-        if include_subtitles and seg.subtitles and not seg.units:
-            excerpt = _truncate_subtitles(seg.subtitles, max_subtitle_chars)
-            lines.append("<details>")
-            lines.append("<summary>Transcript</summary>")
-            lines.append("")
-            lines.append(f"> {excerpt}")
-            lines.append("")
-            lines.append("</details>")
-            lines.append("")
-
-        lines.append("---")
-        lines.append("")
-
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Combined load + generate convenience function
+# Top-level orchestration
 # ---------------------------------------------------------------------------
 
 
@@ -626,132 +250,91 @@ def create_report(
     atlas_dir: str | Path,
     output_path: str | Path | None = None,
     focus: str = "",
-    style: str = "article",
-    include_subtitles: bool = True,
-    max_subtitle_chars: int = 500,
-    frames_per_unit: int = 3,
-    use_mllm: bool = False,
     mllm_client: Any = None,
     mllm_model: str = "Qwen/Qwen3-VL-8B-Instruct",
     writer_client: Any = None,
     writer_model: str = "Qwen/Qwen3-235B-A22B-Instruct-2507",
+    max_probes: int = 15,
 ) -> str:
     """
-    Load video memory and generate a frame-text interleaved report.
+    Load video memory and generate a frame-text interleaved article.
+
+    Pipeline:
+      1. Generate outline from memory
+      2. Agent probes the video via VLM to pick frames per section
+      3. Write the article section-by-section
 
     Parameters
     ----------
     atlas_dir : str | Path
         Path to the atlas output directory.
     output_path : str | Path | None
-        If provided, write the report to this file. Keyframes are saved
-        into a ``frames/`` directory next to the report.
+        If provided, write the article to this file. Frames are saved into a
+        ``frames/`` directory next to the article.
     focus : str
-        Optional focus topic for the report.
-    style : str
-        "article" (LLM-written, default), "detailed", "summary", or "outline".
-        "article" produces a well-written piece using an LLM.
-        Other styles use template-based generation.
-    include_subtitles : bool
-        Include transcript excerpts (for template styles only).
-    max_subtitle_chars : int
-        Max chars per transcript excerpt.
-    frames_per_unit : int
-        Number of keyframes to extract per unit (default 3).
-    use_mllm : bool
-        If True, use a vision LLM to select the most informative frames.
-    mllm_client : OpenAI | None
-        OpenAI-compatible client for vision LLM (frame selection).
+        Optional focus angle for the article.
+    mllm_client : OpenAI
+        Vision LLM client used by the frame agent for probing.
     mllm_model : str
-        Vision model name for frame selection.
-    writer_client : OpenAI | None
-        OpenAI-compatible client for article writing. If None, falls
-        back to mllm_client. Required for style="article".
+        Vision model name.
+    writer_client : OpenAI
+        Writer LLM client. Drives the outline, the frame-selection agent, and
+        the section writer. Falls back to ``mllm_client`` if not given.
     writer_model : str
-        LLM model name for article writing.
+        Writer model name.
+    max_probes : int
+        Maximum frame-agent probes.
 
     Returns
     -------
     str
-        The generated report in Markdown.
+        The generated Markdown article.
     """
     memory = load_atlas_memory(atlas_dir)
 
-    # Determine frames directory
+    w_client = writer_client or mllm_client
+    if w_client is None:
+        raise ValueError("writer_client or mllm_client is required")
+
     frames_dir = None
     report_dir = None
     if output_path:
         out = Path(output_path)
         report_dir = out.parent
         frames_dir = report_dir / "frames"
+    rd = report_dir or Path(memory.atlas_dir)
 
-    if style == "article":
-        w_client = writer_client or mllm_client
-        if w_client is None:
-            raise ValueError("writer_client or mllm_client required for style='article'")
+    from .outline_generator import generate_outline
+    outline = generate_outline(
+        memory=memory,
+        focus=focus,
+        client=w_client,
+        model=writer_model,
+    )
 
-        rd = report_dir or Path(memory.atlas_dir)
-
-        try:
-            # Step 1: Generate article outline (content-first)
-            from .outline_generator import generate_outline
-            outline = generate_outline(
-                memory=memory,
-                focus=focus,
-                client=w_client,
-                model=writer_model,
-            )
-
-            # Step 2: Agent-driven frame selection
-            if frames_dir is not None and memory.video_path:
-                from .frame_agent import select_frames_with_agent
-                outline = select_frames_with_agent(
-                    outline=outline,
-                    memory=memory,
-                    frames_dir=frames_dir,
-                    report_dir=rd,
-                    agent_client=w_client,
-                    agent_model=writer_model,
-                    vlm_client=mllm_client,
-                    vlm_model=mllm_model,
-                )
-
-            # Step 3: Write article section-by-section from outline
-            from .article_writer import write_article_from_outline
-            report = write_article_from_outline(
-                memory=memory,
-                outline=outline,
-                report_dir=rd,
-                focus=focus,
-                client=w_client,
-                model=writer_model,
-            )
-        except Exception as e:
-            print(f"  [create_report] Pipeline failed ({e}), falling back to single-shot")
-            import traceback
-            traceback.print_exc()
-            from .article_writer import write_article
-            report = write_article(
-                memory=memory,
-                report_dir=rd,
-                focus=focus,
-                client=w_client,
-                model=writer_model,
-            )
-    else:
-        report = generate_report(
-            memory,
-            focus=focus,
-            style=style,
-            include_subtitles=include_subtitles,
-            max_subtitle_chars=max_subtitle_chars,
+    if frames_dir is not None and memory.video_path:
+        from .frame_agent import select_frames_with_agent
+        outline = select_frames_with_agent(
+            outline=outline,
+            memory=memory,
             frames_dir=frames_dir,
-            frames_per_unit=frames_per_unit,
-            report_dir=report_dir,
-            use_mllm=use_mllm,
-            mllm_client=mllm_client,
-            mllm_model=mllm_model,
+            report_dir=rd,
+            agent_client=w_client,
+            agent_model=writer_model,
+            vlm_client=mllm_client,
+            vlm_model=mllm_model,
+            max_probes=max_probes,
         )
+
+    from .article_writer import write_article_from_outline
+    report = write_article_from_outline(
+        memory=memory,
+        outline=outline,
+        report_dir=rd,
+        focus=focus,
+        client=w_client,
+        model=writer_model,
+    )
 
     if output_path:
         out = Path(output_path)

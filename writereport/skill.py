@@ -1,9 +1,13 @@
 """
 Write Report Skill — LLM tool definition and runner.
 
-Provides a tool that reads video memory (atlas directory) and generates
-a detailed interleaved report.  The `TOOL_DEFINITION` dict can be registered
-directly with any OpenAI-compatible function-calling LLM.
+Provides a tool that reads video memory (atlas directory) and generates a
+frame-text interleaved article. The pipeline uses an agent that probes the
+video via a VLM to select section-appropriate frames, then writes the article
+section-by-section.
+
+`TOOL_DEFINITION` can be registered directly with any OpenAI-compatible
+function-calling LLM.
 """
 
 from __future__ import annotations
@@ -11,7 +15,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from .write_report import load_atlas_memory, generate_report, create_report
+from .write_report import load_atlas_memory, create_report
+
 
 # ---------------------------------------------------------------------------
 # Tool definitions (OpenAI function-calling format)
@@ -22,11 +27,12 @@ TOOL_DEFINITION: dict[str, Any] = {
     "function": {
         "name": "write_report",
         "description": (
-            "Generate a frame-text interleaved report from video memory (atlas directory). "
-            "The report extracts keyframes from each video segment and interleaves them "
-            "with text analysis, timestamps, and transcript excerpts as a Markdown document. "
-            "When output_path is provided, keyframes are saved to a frames/ directory next to the report. "
-            "The atlas directory must have been previously created by the video memory module (mm-harness)."
+            "Generate a frame-text interleaved article from video memory (atlas directory). "
+            "The pipeline plans an outline, uses an agent to probe the video via a vision "
+            "model and pick the best frames for each section, then writes the article "
+            "section-by-section. When output_path is provided, frames are saved to a "
+            "frames/ directory next to the article. The atlas directory must have been "
+            "previously created by the video memory module (mm-harness)."
         ),
         "parameters": {
             "type": "object",
@@ -42,45 +48,25 @@ TOOL_DEFINITION: dict[str, Any] = {
                 "output_path": {
                     "type": "string",
                     "description": (
-                        "Optional file path to save the report. "
-                        "If omitted, the report is returned as text only."
+                        "Optional file path to save the article. "
+                        "If omitted, the article is returned as text only."
                     ),
                 },
                 "focus": {
                     "type": "string",
                     "description": (
-                        "Optional focus topic for the report. "
-                        "When provided, the report header notes this focus so you can "
-                        "further refine content around it."
+                        "Optional focus angle for the article. Shapes the outline "
+                        "around this topic."
                     ),
                     "default": "",
                 },
-                "style": {
-                    "type": "string",
-                    "enum": ["article", "detailed", "summary", "outline"],
+                "max_probes": {
+                    "type": "integer",
                     "description": (
-                        "Report style. "
-                        "'article' (default) generates an LLM-written article with outline planning and section-by-section writing. "
-                        "'detailed' uses template-based formatting with full unit breakdowns. "
-                        "'summary' includes segment summaries only. "
-                        "'outline' lists segment and unit titles with time ranges."
+                        "Maximum number of frame-agent probes. Each probe extracts and "
+                        "inspects frames from one time range. Default is 15."
                     ),
-                    "default": "detailed",
-                },
-                "include_subtitles": {
-                    "type": "boolean",
-                    "description": "Whether to include transcript excerpts in each section.",
-                    "default": True,
-                },
-                "max_subtitle_chars": {
-                    "type": "integer",
-                    "description": "Maximum characters per transcript excerpt.",
-                    "default": 500,
-                },
-                "frames_per_unit": {
-                    "type": "integer",
-                    "description": "Number of keyframes to extract per video unit. Default is 3.",
-                    "default": 3,
+                    "default": 15,
                 },
             },
             "required": ["atlas_dir"],
@@ -115,7 +101,6 @@ LOAD_MEMORY_TOOL_DEFINITION: dict[str, Any] = {
 }
 
 
-# Convenience: list of all tool definitions for batch registration
 ALL_TOOL_DEFINITIONS = [TOOL_DEFINITION, LOAD_MEMORY_TOOL_DEFINITION]
 
 
@@ -136,7 +121,7 @@ def _memory_to_dict(memory) -> dict[str, Any]:
             "detail": u.detail,
         }
         if u.subtitles:
-            d["subtitles"] = u.subtitles[:1000]  # cap for LLM context
+            d["subtitles"] = u.subtitles[:1000]
         if u.clip_path:
             d["clip_path"] = u.clip_path
         return d
@@ -174,7 +159,6 @@ def _memory_to_dict(memory) -> dict[str, Any]:
 
 
 # Shared client config — set these before calling run_tool
-# so the article writer and frame selector have access to LLM clients.
 _mllm_client = None
 _mllm_model = "Qwen/Qwen3-VL-8B-Instruct"
 _writer_client = None
@@ -199,17 +183,13 @@ def run_tool(arguments: dict[str, Any]) -> str:
     """
     Execute the write_report tool from LLM function-calling arguments.
 
-    Returns the Markdown report as a string.
+    Returns the Markdown article as a string.
     """
     report = create_report(
         atlas_dir=arguments["atlas_dir"],
         output_path=arguments.get("output_path"),
         focus=arguments.get("focus", ""),
-        style=arguments.get("style", "article"),
-        include_subtitles=arguments.get("include_subtitles", True),
-        max_subtitle_chars=arguments.get("max_subtitle_chars", 500),
-        frames_per_unit=arguments.get("frames_per_unit", 3),
-        use_mllm=_mllm_client is not None,
+        max_probes=arguments.get("max_probes", 15),
         mllm_client=_mllm_client,
         mllm_model=_mllm_model,
         writer_client=_writer_client,
@@ -219,35 +199,12 @@ def run_tool(arguments: dict[str, Any]) -> str:
 
 
 def run_load_memory_tool(arguments: dict[str, Any]) -> str:
-    """
-    Execute the load_video_memory tool from LLM function-calling arguments.
-
-    Returns the structured memory as a JSON string.
-    """
+    """Execute the load_video_memory tool and return JSON."""
     memory = load_atlas_memory(arguments["atlas_dir"])
     return json.dumps(_memory_to_dict(memory), ensure_ascii=False, indent=2)
 
 
-# Tool name → runner mapping for dispatcher convenience
 TOOL_RUNNERS = {
     "write_report": run_tool,
     "load_video_memory": run_load_memory_tool,
 }
-
-
-# ---------------------------------------------------------------------------
-# Quick CLI test
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    import sys
-
-    if len(sys.argv) < 2:
-        print("Usage: python -m writereport.skill <atlas_dir> [style]")
-        sys.exit(1)
-
-    atlas_dir = sys.argv[1]
-    style = sys.argv[2] if len(sys.argv) > 2 else "detailed"
-
-    report = create_report(atlas_dir, style=style)
-    print(report)
