@@ -693,21 +693,7 @@ def create_report(
         rd = report_dir or Path(memory.atlas_dir)
 
         try:
-            # Step 1: Build global frame pool from full video
-            from .frame_pool import extract_candidate_pool, build_frame_pool, match_frames_to_sections
-
-            pool = []
-            if frames_dir is not None and memory.video_path:
-                duration = _hms_to_seconds(memory.video_duration) if memory.video_duration else 600
-                candidates = extract_candidate_pool(
-                    video_path=memory.video_path,
-                    duration=duration,
-                    output_dir=frames_dir / "_candidates",
-                    interval_sec=2.0,
-                )
-                pool = build_frame_pool(candidates, max_pool_size=25)
-
-            # Step 2: Generate article outline (content-first, no frames yet)
+            # Step 1: Generate article outline (content-first)
             from .outline_generator import generate_outline
             outline = generate_outline(
                 memory=memory,
@@ -716,20 +702,21 @@ def create_report(
                 model=writer_model,
             )
 
-            # Step 3: Match frames to sections using VLM
-            if pool and frames_dir is not None:
-                outline = match_frames_to_sections(
-                    pool=pool,
+            # Step 2: Agent-driven frame selection
+            if frames_dir is not None and memory.video_path:
+                from .frame_agent import select_frames_with_agent
+                outline = select_frames_with_agent(
                     outline=outline,
                     memory=memory,
                     frames_dir=frames_dir,
                     report_dir=rd,
-                    client=mllm_client,
-                    model=mllm_model,
-                    max_frames_per_section=frames_per_unit,
+                    agent_client=w_client,
+                    agent_model=writer_model,
+                    vlm_client=mllm_client,
+                    vlm_model=mllm_model,
                 )
 
-            # Step 4: Write article section-by-section from outline
+            # Step 3: Write article section-by-section from outline
             from .article_writer import write_article_from_outline
             report = write_article_from_outline(
                 memory=memory,
