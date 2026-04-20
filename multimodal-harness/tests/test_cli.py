@@ -4,6 +4,7 @@ import subprocess
 import sys
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import ANY, MagicMock, patch
 
@@ -142,6 +143,23 @@ class CliSmokeTest(unittest.TestCase):
         self.assertEqual(args.audio_file, "/tmp/audio.m4a")
         self.assertIsNone(args.url)
 
+    def test_build_parser_supports_create_with_config_override(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "create",
+                "--audio-file",
+                "/tmp/audio.m4a",
+                "--config",
+                "/tmp/custom-config.json",
+                "--output-dir",
+                "/tmp/out",
+            ]
+        )
+
+        self.assertEqual(args.command, "create")
+        self.assertEqual(args.config, "/tmp/custom-config.json")
+
     def test_build_parser_supports_skill_command(self) -> None:
         parser = build_parser()
         args = parser.parse_args(["skill", "--install"])
@@ -181,11 +199,14 @@ class CliSmokeTest(unittest.TestCase):
 
     @patch("video_atlas.cli.main.create_canonical_from_url")
     @patch("video_atlas.cli.main.load_canonical_pipeline_config")
+    @patch("video_atlas.cli.main._resolve_canonical_config_path")
     def test_main_runs_create_from_url(
         self,
+        mock_resolve_config_path: MagicMock,
         mock_load_config: MagicMock,
         mock_create_canonical_from_url: MagicMock,
     ) -> None:
+        mock_resolve_config_path.return_value = "/tmp/default-config.json"
         mock_load_config.return_value = MagicMock(
             runtime=MagicMock(),
             acquisition=MagicMock(),
@@ -216,6 +237,8 @@ class CliSmokeTest(unittest.TestCase):
         self.assertIn("Creating canonical atlas...", stdout.getvalue())
         self.assertIn("Done", stdout.getvalue())
         self.assertIn("atlas_dir: /tmp/out/run-url", stdout.getvalue())
+        mock_resolve_config_path.assert_called_once_with(None)
+        mock_load_config.assert_called_once_with("/tmp/default-config.json")
         mock_create_canonical_from_url.assert_called_once_with(
             "https://www.youtube.com/watch?v=abc123xyz89",
             tmpdir,
@@ -226,11 +249,14 @@ class CliSmokeTest(unittest.TestCase):
 
     @patch("video_atlas.cli.main.create_canonical_from_local")
     @patch("video_atlas.cli.main.load_canonical_pipeline_config")
+    @patch("video_atlas.cli.main._resolve_canonical_config_path")
     def test_main_runs_create_from_local_files(
         self,
+        mock_resolve_config_path: MagicMock,
         mock_load_config: MagicMock,
         mock_create_canonical_from_local: MagicMock,
     ) -> None:
+        mock_resolve_config_path.return_value = "/tmp/default-config.json"
         mock_load_config.return_value = MagicMock(
             runtime=MagicMock(),
             acquisition=MagicMock(),
@@ -264,6 +290,8 @@ class CliSmokeTest(unittest.TestCase):
         self.assertIn("atlas_dir: /tmp/out/run-001", stdout.getvalue())
         self.assertIn("output_language: zh", stdout.getvalue())
         self.assertIn("segments: 2", stdout.getvalue())
+        mock_resolve_config_path.assert_called_once_with(None)
+        mock_load_config.assert_called_once_with("/tmp/default-config.json")
         mock_create_canonical_from_local.assert_called_once_with(
             tmpdir,
             mock_load_config.return_value,
@@ -277,11 +305,14 @@ class CliSmokeTest(unittest.TestCase):
 
     @patch("video_atlas.cli.main.create_canonical_from_local")
     @patch("video_atlas.cli.main.load_canonical_pipeline_config")
+    @patch("video_atlas.cli.main._resolve_canonical_config_path")
     def test_main_runs_create_from_local_audio_file(
         self,
+        mock_resolve_config_path: MagicMock,
         mock_load_config: MagicMock,
         mock_create_canonical_from_local: MagicMock,
     ) -> None:
+        mock_resolve_config_path.return_value = "/tmp/default-config.json"
         mock_load_config.return_value = MagicMock(
             runtime=MagicMock(),
             acquisition=MagicMock(),
@@ -307,6 +338,8 @@ class CliSmokeTest(unittest.TestCase):
                 )
 
         self.assertEqual(exit_code, 0)
+        mock_resolve_config_path.assert_called_once_with(None)
+        mock_load_config.assert_called_once_with("/tmp/default-config.json")
         mock_create_canonical_from_local.assert_called_once_with(
             tmpdir,
             mock_load_config.return_value,
@@ -318,6 +351,58 @@ class CliSmokeTest(unittest.TestCase):
             on_progress=ANY,
         )
         self.assertIn("output_language: en", stdout.getvalue())
+
+    @patch("video_atlas.cli.main.create_canonical_from_local")
+    @patch("video_atlas.cli.main.load_canonical_pipeline_config")
+    @patch("video_atlas.cli.main._resolve_canonical_config_path")
+    def test_main_runs_create_with_explicit_config_path(
+        self,
+        mock_resolve_config_path: MagicMock,
+        mock_load_config: MagicMock,
+        mock_create_canonical_from_local: MagicMock,
+    ) -> None:
+        mock_resolve_config_path.return_value = "/tmp/custom-config.json"
+        mock_load_config.return_value = MagicMock(
+            runtime=MagicMock(),
+            acquisition=MagicMock(),
+        )
+        atlas = MagicMock()
+        atlas.atlas_dir = "/tmp/out/run-003"
+        atlas.title = "Configured Atlas"
+        atlas.execution_plan.output_language = "en"
+        atlas.segments = [MagicMock()]
+        mock_create_canonical_from_local.return_value = (atlas, {})
+
+        with TemporaryDirectory() as tmpdir:
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                exit_code = main(
+                    [
+                        "create",
+                        "--audio-file",
+                        "/tmp/audio.m4a",
+                        "--config",
+                        "/tmp/custom-config.json",
+                        "--output-dir",
+                        tmpdir,
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0)
+        mock_resolve_config_path.assert_called_once_with("/tmp/custom-config.json")
+        mock_load_config.assert_called_once_with("/tmp/custom-config.json")
+        self.assertIn("atlas_dir: /tmp/out/run-003", stdout.getvalue())
+
+    def test_resolve_canonical_config_path_uses_absolute_explicit_path(self) -> None:
+        from video_atlas.cli.main import _resolve_canonical_config_path
+
+        with TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "custom-config.json"
+            config_path.write_text("{}", encoding="utf-8")
+
+            resolved = _resolve_canonical_config_path(str(config_path))
+
+        self.assertEqual(resolved, str(config_path.resolve()))
 
     @patch.dict(
         os.environ,
