@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+from importlib.resources import as_file, files
 import platform
+from pathlib import Path
 import shutil
 import sys
 import time
@@ -28,6 +30,21 @@ def _print_create_summary(atlas, cost_time: float) -> None:
     print(f"output_language: {atlas.execution_plan.output_language}")
     print(f"segments: {len(atlas.segments)}")
     print(f"cost_time: {cost_time:.2f}s")
+
+
+def _resolve_canonical_config_path(config_path: str | None) -> str:
+    if config_path:
+        resolved = Path(config_path).expanduser().resolve()
+        if not resolved.is_file():
+            raise CliUsageError(f"config file not found: {resolved}")
+        return str(resolved)
+
+    resource = files("video_atlas").joinpath("canonical/default.json")
+    with as_file(resource) as extracted_path:
+        resolved = Path(extracted_path).resolve()
+        if not resolved.is_file():
+            raise CliUsageError(f"default config resource not found: {resolved}")
+        return str(resolved)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -74,6 +91,7 @@ def build_parser() -> argparse.ArgumentParser:
     create_parser.add_argument("--audio-file")
     create_parser.add_argument("--subtitle-file")
     create_parser.add_argument("--metadata-file")
+    create_parser.add_argument("--config")
     create_parser.add_argument("--output-dir", required=True)
     create_parser.add_argument("--structure-request", default="")
     return parser
@@ -213,7 +231,7 @@ def _run_skill(args) -> int:
 
 
 def _run_canonical_create(args) -> int:
-    config = load_canonical_pipeline_config("configs/canonical/default.json")
+    config = load_canonical_pipeline_config(_resolve_canonical_config_path(args.config))
     local_inputs = [args.video_file, args.audio_file, args.subtitle_file, args.metadata_file]
     print("Creating canonical atlas...")
     started_at = time.time()

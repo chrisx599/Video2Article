@@ -9,6 +9,14 @@ from video_atlas.config import load_canonical_pipeline_config, load_derived_pipe
 
 
 class ConfigLoadingTest(unittest.TestCase):
+    def test_packaging_declares_default_canonical_config_as_package_data(self) -> None:
+        pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
+        pyproject_text = pyproject_path.read_text(encoding="utf-8")
+        packaged_config_path = Path(__file__).resolve().parents[1] / "src" / "video_atlas" / "canonical" / "default.json"
+
+        self.assertTrue(packaged_config_path.is_file())
+        self.assertIn('video_atlas = ["skill/SKILL.md", "canonical/default.json"]', pyproject_text)
+
     def test_load_canonical_pipeline_config_reads_acquisition_config(self) -> None:
         payload = {
             "planner": {"provider": "openai_compatible", "model_name": "planner-model"},

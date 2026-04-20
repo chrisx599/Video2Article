@@ -13,6 +13,8 @@ dependencies = [
     "numpy>=1.24",
     "opencv-python>=4.8",
     "pydantic>=2,<3",
+    "python-dateutil",
+    "requests",
     "yt-dlp>=2025.3.31",
 ]
 
@@ -30,4 +32,4 @@ include-package-data = true
 where = ["src"]
 
 [tool.setuptools.package-data]
-video_atlas = ["skill/SKILL.md"]
+video_atlas = ["skill/SKILL.md", "canonical/default.json"]
